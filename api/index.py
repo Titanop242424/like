@@ -14,16 +14,126 @@ import random
 import time
 import os
 import hashlib
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 API_KEY = "TITAN"
+TOKEN_CACHE_FILE = "tokens_cache.json"
+TOKEN_EXPIRY_HOURS = 5  # Tokens valid for 5 hours
 
-# ================= LOAD ACCOUNTS FROM accounts.json =================
+# ================= TOKEN CACHE MANAGEMENT =================
+def load_token_cache():
+    """Load cached tokens from file"""
+    try:
+        possible_paths = [
+            TOKEN_CACHE_FILE,
+            "/tmp/tokens_cache.json",
+            os.path.join(os.path.dirname(__file__), "..", TOKEN_CACHE_FILE),
+            os.path.join(os.path.dirname(__file__), TOKEN_CACHE_FILE)
+        ]
+        
+        for path in possible_paths:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    cache_data = json.load(f)
+                    print(f"✅ Loaded token cache from {path}")
+                    return cache_data
+        return {"tokens": [], "generated_at": None}
+    except Exception as e:
+        print(f"⚠️ Error loading token cache: {e}")
+        return {"tokens": [], "generated_at": None}
+
+def save_token_cache(cache_data):
+    """Save tokens to cache file"""
+    try:
+        # Try to save in multiple locations
+        save_paths = [
+            TOKEN_CACHE_FILE,
+            "/tmp/tokens_cache.json",
+            os.path.join(os.path.dirname(__file__), TOKEN_CACHE_FILE)
+        ]
+        
+        for path in save_paths:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(cache_data, f, indent=2)
+                print(f"✅ Token cache saved to {path}")
+                return True
+            except:
+                continue
+        return False
+    except Exception as e:
+        print(f"❌ Error saving token cache: {e}")
+        return False
+
+def is_token_cache_valid(cache_data):
+    """Check if cached tokens are still valid (within 5 hours)"""
+    if not cache_data or not cache_data.get("tokens"):
+        return False
+    
+    generated_at = cache_data.get("generated_at")
+    if not generated_at:
+        return False
+    
+    try:
+        gen_time = datetime.fromisoformat(generated_at)
+        current_time = datetime.now()
+        time_diff = current_time - gen_time
+        
+        # Check if less than TOKEN_EXPIRY_HOURS
+        if time_diff.total_seconds() < (TOKEN_EXPIRY_HOURS * 3600):
+            print(f"✅ Cached tokens are valid (Age: {time_diff.total_seconds()/3600:.1f} hours)")
+            return True
+        else:
+            print(f"⚠️ Cached tokens expired (Age: {time_diff.total_seconds()/3600:.1f} hours)")
+            return False
+    except Exception as e:
+        print(f"⚠️ Error checking token validity: {e}")
+        return False
+
+def get_cached_tokens(limit=None):
+    """Get tokens from cache if valid"""
+    cache_data = load_token_cache()
+    
+    if not is_token_cache_valid(cache_data):
+        print("🔄 Cache invalid or expired, need to regenerate")
+        return None
+    
+    tokens = cache_data.get("tokens", [])
+    
+    # Filter only enabled accounts from cache
+    valid_tokens = []
+    for token in tokens:
+        uid = token.get("uid")
+        # Check if this account is still enabled in accounts.json
+        account_enabled = False
+        for acc in ACCOUNTS:
+            if acc.get("uid") == uid and acc.get("enabled", True):
+                account_enabled = True
+                break
+        if account_enabled:
+            valid_tokens.append(token)
+    
+    # If limit is specified, return only that many tokens
+    if limit and limit > 0:
+        return valid_tokens[:limit]
+    return valid_tokens
+
+def update_token_cache(new_tokens):
+    """Update token cache with new tokens"""
+    cache_data = {
+        "tokens": new_tokens,
+        "generated_at": datetime.now().isoformat(),
+        "total_tokens": len(new_tokens),
+        "expires_at": (datetime.now() + timedelta(hours=TOKEN_EXPIRY_HOURS)).isoformat()
+    }
+    save_token_cache(cache_data)
+    return cache_data
+
+# ================= LOAD ACCOUNTS =================
 def load_accounts():
     try:
-        # For Vercel, check multiple possible paths
         possible_paths = [
             "accounts.json",
             "/tmp/accounts.json",
@@ -105,114 +215,154 @@ def encrypt_api(data):
     return cipher.encrypt(pad(data, AES.block_size))
 
 # ================= TOKEN GENERATOR =================
-def get_fresh_tokens():
-    """accounts.json se accounts lekar direct token generate karega"""
+def get_fresh_token_for_account(acc):
+    """Generate token for a single account"""
+    try:
+        uid = acc.get("uid")
+        password = acc.get("password")
+        if not uid or not password:
+            return None
+        
+        # ===== GET ACCESS TOKEN =====
+        url = "https://100067.connect.garena.com/oauth/guest/token/grant"
+        
+        data = {
+            "uid": uid,
+            "password": password,
+            "response_type": "token",
+            "client_type": "2",
+            "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
+            "client_id": "100067"
+        }
+        
+        headers = {
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 13)",
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        resp = requests.post(url, data=data, headers=headers, verify=False, timeout=15)
+        
+        if resp.status_code == 200:
+            resp_data = resp.json()
+            access_token = resp_data.get("access_token")
+            open_id = resp_data.get("open_id")
+            
+            if access_token and open_id:
+                # ===== CONVERT TO JWT VIA MAJORLOGIN =====
+                jwt_url = "https://loginbp.ggpolarbear.com/MajorLogin"
+                
+                now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                
+                payload_fields = {
+                    3: now, 4: "free fire", 5: 1,
+                    7: "1.126.5",
+                    8: "Android OS 5.1.1 / API-22",
+                    9: "Handheld", 10: "Reliance Jio",
+                    11: "WIFI", 17: "Adreno (TM) 640",
+                    18: "OpenGL ES 3.0",
+                    19: f"Google|{random.randint(1000000000, 9999999999)}",
+                    20: f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}",
+                    21: "en", 22: open_id,
+                    23: 4, 24: "Handheld",
+                    25: "Samsung SM-G998B",
+                    26: "IND",
+                    29: access_token,
+                    33: "Reliance Jio", 34: "WIFI",
+                    37: "7428b253defc164018c604a1ebbfebdf",
+                    73: "/data/app/com.dts.freefireth-1/lib/arm",
+                    75: f"{random.randint(100000000,999999999)}|/data/app/com.dts.freefireth-1/base.apk",
+                    76: 2, 78: 2, 79: 2,
+                    83: "OpenGLES2", 85: "Mumbai",
+                    87: "android",
+                    88: "KqsHT8nWdkA7u/m7k8vg2H5FgrCGa4lfww3nHBGRHRPwDFV4LyCj8sT23O/P6K06qC3MOLZRThwWwul+g2goHwtQJy8=",
+                    90: '{"cur_rate":null,"support_etc2":false}',
+                    97: 1, 98: 1, 99: "4", 100: "4"
+                }
+                
+                proto_bytes = build_proto(payload_fields)
+                encrypted = encrypt_api(proto_bytes)
+                
+                jwt_headers = {
+                    "Accept": "*/*",
+                    "Accept-Encoding": "deflate, gzip",
+                    "Authorization": "Bearer",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Host": "loginbp.ggpolarbear.com",
+                    "ReleaseVersion": "OB54",
+                    "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
+                    "X-GA": "v1 1",
+                    "X-Unity-Version": "2022.3.47f1"
+                }
+                
+                jwt_resp = requests.post(jwt_url, headers=jwt_headers, data=encrypted, verify=False, timeout=15)
+                
+                if jwt_resp.status_code == 200:
+                    text = jwt_resp.text
+                    jwt_start = text.find("eyJ")
+                    if jwt_start != -1:
+                        jwt_token = text[jwt_start:]
+                        second_dot = jwt_token.find(".", jwt_token.find(".") + 1)
+                        if second_dot != -1:
+                            jwt_token = jwt_token[:second_dot + 44]
+                            if jwt_token.startswith("eyJ"):
+                                print(f"✅ Token generated for {uid}")
+                                return {"token": jwt_token, "uid": uid}
+                
+                print(f"⚠️ JWT generation failed for {uid}")
+            else:
+                print(f"⚠️ Token generation failed for {uid}")
+        return None
+    except Exception as e:
+        print(f"❌ Error for {uid}: {e}")
+        return None
+
+def generate_all_tokens():
+    """Generate tokens for all accounts and cache them"""
     if not ACCOUNTS:
         print("❌ No accounts available")
         return []
     
+    print(f"🔄 Generating tokens for {len(ACCOUNTS)} accounts...")
     tokens = []
+    
     for acc in ACCOUNTS:
-        try:
-            uid = acc.get("uid")
-            password = acc.get("password")
-            if not uid or not password:
-                continue
-            
-            # ===== GET ACCESS TOKEN =====
-            url = "https://100067.connect.garena.com/oauth/guest/token/grant"
-            
-            data = {
-                "uid": uid,
-                "password": password,
-                "response_type": "token",
-                "client_type": "2",
-                "client_secret": "2ee44819e9b4598845141067b281621874d0d5d7af9d8f7e00c1e54715b7d1e3",
-                "client_id": "100067"
-            }
-            
-            headers = {
-                "User-Agent": "Dalvik/2.1.0 (Linux; U; Android 13)",
-                "Content-Type": "application/x-www-form-urlencoded"
-            }
-            
-            resp = requests.post(url, data=data, headers=headers, verify=False, timeout=15)
-            
-            if resp.status_code == 200:
-                resp_data = resp.json()
-                access_token = resp_data.get("access_token")
-                open_id = resp_data.get("open_id")
-                
-                if access_token and open_id:
-                    # ===== CONVERT TO JWT VIA MAJORLOGIN =====
-                    jwt_url = "https://loginbp.ggpolarbear.com/MajorLogin"
-                    
-                    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                    
-                    payload_fields = {
-                        3: now, 4: "free fire", 5: 1,
-                        7: "1.126.5",
-                        8: "Android OS 5.1.1 / API-22",
-                        9: "Handheld", 10: "Reliance Jio",
-                        11: "WIFI", 17: "Adreno (TM) 640",
-                        18: "OpenGL ES 3.0",
-                        19: f"Google|{random.randint(1000000000, 9999999999)}",
-                        20: f"{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}.{random.randint(1,255)}",
-                        21: "en", 22: open_id,
-                        23: 4, 24: "Handheld",
-                        25: "Samsung SM-G998B",
-                        26: "IND",
-                        29: access_token,
-                        33: "Reliance Jio", 34: "WIFI",
-                        37: "7428b253defc164018c604a1ebbfebdf",
-                        73: "/data/app/com.dts.freefireth-1/lib/arm",
-                        75: f"{random.randint(100000000,999999999)}|/data/app/com.dts.freefireth-1/base.apk",
-                        76: 2, 78: 2, 79: 2,
-                        83: "OpenGLES2", 85: "Mumbai",
-                        87: "android",
-                        88: "KqsHT8nWdkA7u/m7k8vg2H5FgrCGa4lfww3nHBGRHRPwDFV4LyCj8sT23O/P6K06qC3MOLZRThwWwul+g2goHwtQJy8=",
-                        90: '{"cur_rate":null,"support_etc2":false}',
-                        97: 1, 98: 1, 99: "4", 100: "4"
-                    }
-                    
-                    proto_bytes = build_proto(payload_fields)
-                    encrypted = encrypt_api(proto_bytes)
-                    
-                    jwt_headers = {
-                        "Accept": "*/*",
-                        "Accept-Encoding": "deflate, gzip",
-                        "Authorization": "Bearer",
-                        "Content-Type": "application/x-www-form-urlencoded",
-                        "Host": "loginbp.ggpolarbear.com",
-                        "ReleaseVersion": "OB54",
-                        "User-Agent": "UnityPlayer/2022.3.47f1 (UnityWebRequest/1.0, libcurl/8.5.0-DEV)",
-                        "X-GA": "v1 1",
-                        "X-Unity-Version": "2022.3.47f1"
-                    }
-                    
-                    jwt_resp = requests.post(jwt_url, headers=jwt_headers, data=encrypted, verify=False, timeout=15)
-                    
-                    if jwt_resp.status_code == 200:
-                        text = jwt_resp.text
-                        jwt_start = text.find("eyJ")
-                        if jwt_start != -1:
-                            jwt_token = text[jwt_start:]
-                            second_dot = jwt_token.find(".", jwt_token.find(".") + 1)
-                            if second_dot != -1:
-                                jwt_token = jwt_token[:second_dot + 44]
-                                if jwt_token.startswith("eyJ"):
-                                    tokens.append({"token": jwt_token, "uid": uid})
-                                    print(f"✅ Token generated for {uid}")
-                                    continue
-                    
-                    print(f"⚠️ JWT generation failed for {uid}")
-                else:
-                    print(f"⚠️ Token generation failed for {uid}")
-        except Exception as e:
-            print(f"❌ Error for {uid}: {e}")
+        token_data = get_fresh_token_for_account(acc)
+        if token_data:
+            tokens.append(token_data)
+    
+    print(f"✅ Generated {len(tokens)} valid tokens out of {len(ACCOUNTS)} accounts")
+    
+    # Save to cache
+    if tokens:
+        update_token_cache(tokens)
     
     return tokens
 
+def get_tokens(limit=None):
+    """
+    Get tokens from cache if valid, otherwise generate new ones
+    limit: Number of tokens needed (0 or None = all)
+    """
+    # Try to get from cache first
+    cached_tokens = get_cached_tokens(limit)
+    
+    if cached_tokens is not None:
+        # Check if we have enough tokens for the requested limit
+        if limit and limit > 0:
+            if len(cached_tokens) >= limit:
+                print(f"✅ Using {limit} cached tokens")
+                return cached_tokens[:limit]
+            else:
+                print(f"⚠️ Cache has {len(cached_tokens)} tokens, need {limit}. Regenerating...")
+        else:
+            print(f"✅ Using all {len(cached_tokens)} cached tokens")
+            return cached_tokens
+    
+    # Cache invalid or not enough tokens, generate fresh
+    print("🔄 Generating fresh tokens...")
+    return generate_all_tokens()
+
+# ================= LIKE SENDING FUNCTIONS =================
 async def send_single_like_request(encrypted_like_payload, token_dict, url):
     edata = bytes.fromhex(encrypted_like_payload)
     token_value = token_dict.get("token", "")
@@ -232,7 +382,6 @@ async def send_single_like_request(encrypted_like_payload, token_dict, url):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.post(url, data=edata, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                response_text = await response.text()
                 print(f"   Like response for {token_dict.get('uid', 'unknown')}: {response.status}")
                 return response.status
     except Exception as e:
@@ -246,15 +395,20 @@ async def send_likes_with_token_batch(uid, server_region, like_api_url, token_ba
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
     successful = 0
+    failed = 0
     for r in results:
         if isinstance(r, int) and r == 200:
             successful += 1
         elif isinstance(r, int) and r == 403:
             print(f"⚠️ 403 Forbidden - Token may be invalid")
+            failed += 1
         elif isinstance(r, int) and r == 429:
             print(f"⚠️ 429 Rate limited")
+            failed += 1
+        else:
+            failed += 1
     
-    return successful
+    return successful, failed
 
 # ================= PROFILE CHECK =================
 def make_profile_check_request(encrypted_profile_payload, server_name, token_dict):
@@ -318,17 +472,39 @@ def handle_requests():
     uid_param = request.args.get("uid")
     server_name_param = request.args.get("server_name", "").upper()
     
+    # Get likes limit parameter
+    likes_limit_param = request.args.get("limit")
+    if likes_limit_param is not None:
+        try:
+            likes_limit = int(likes_limit_param)
+            if likes_limit < 0:
+                likes_limit = 0
+        except ValueError:
+            return jsonify({"error": "Invalid limit value. Must be a number."}), 400
+    else:
+        likes_limit = 0  # 0 means use all accounts
+    
     if not uid_param or not server_name_param:
         return jsonify({"error": "UID and server_name are required"}), 400
 
-    print(f"📊 Processing like request for UID: {uid_param}, Region: {server_name_param}")
-    
-    fresh_tokens = get_fresh_tokens()
+    print(f"📊 Processing like request for UID: {uid_param}, Region: {server_name_param}, Requested Likes: {likes_limit if likes_limit > 0 else 'ALL'}")
+
+    # Get tokens (from cache or generate new)
+    start_time = time.time()
+    token_limit = likes_limit if likes_limit > 0 else None
+    fresh_tokens = get_tokens(token_limit)
     
     if not fresh_tokens:
-        return jsonify({"error": "Failed to generate fresh tokens. Check accounts.json."}), 500
+        return jsonify({"error": "Failed to get any valid tokens. Check accounts.json."}), 500
 
-    print(f"✅ Generated {len(fresh_tokens)} tokens")
+    token_time = time.time() - start_time
+    print(f"⏱️ Token retrieval took {token_time:.2f} seconds")
+
+    # Use only the number of tokens requested
+    if likes_limit > 0 and len(fresh_tokens) > likes_limit:
+        fresh_tokens = fresh_tokens[:likes_limit]
+    
+    print(f"✅ Using {len(fresh_tokens)} tokens (Requested: {likes_limit if likes_limit > 0 else 'ALL'})")
 
     visit_token = fresh_tokens[0]
     encrypted_profile = enc_profile_check_payload(int(uid_param))
@@ -346,14 +522,16 @@ def handle_requests():
     else:
         like_api_url = "https://clientbp.ggpolarbear.com/LikeProfile"
 
+    send_start = time.time()
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        likes_sent = loop.run_until_complete(send_likes_with_token_batch(uid_param, server_name_param, like_api_url, fresh_tokens))
+        likes_sent, failed_count = loop.run_until_complete(send_likes_with_token_batch(uid_param, server_name_param, like_api_url, fresh_tokens))
     finally:
         loop.close()
+    send_time = time.time() - send_start
         
-    print(f"❤️ Likes sent: {likes_sent}")
+    print(f"❤️ Likes sent successfully: {likes_sent}, Failed: {failed_count}")
     
     time.sleep(2)
     after_info = make_profile_check_request(encrypted_profile, server_name_param, visit_token)
@@ -362,17 +540,75 @@ def handle_requests():
     print(f"📊 After likes: {after_likes}")
     
     likes_given = after_likes - before_likes
+    total_time = time.time() - start_time
     
-    return jsonify({
+    # Get cache info
+    cache_data = load_token_cache()
+    is_cached = is_token_cache_valid(cache_data)
+    cache_expiry = cache_data.get("expires_at", "N/A") if cache_data else "N/A"
+    
+    # Prepare response with detailed info
+    requested_display = likes_limit if likes_limit > 0 else "ALL"
+    response_data = {
         "LikesGivenByAPI": likes_given,
         "LikesafterCommand": after_likes,
         "LikesbeforeCommand": before_likes,
         "PlayerNickname": player_name,
         "UID": uid_param,
         "status": 1 if likes_given > 0 else 2,
-        "Note": f"Generated {len(fresh_tokens)} fresh tokens.",
-        "Owner": "@XEROX_MODS",
-        "Tg": "SEXTYMODS"
+        "RequestedLikes": requested_display,
+        "LikesSent": likes_sent,
+        "FailedLikes": failed_count,
+        "TotalAccountsUsed": len(fresh_tokens),
+        "TotalAccountsAvailable": len(ACCOUNTS),
+        "TokenSource": "Cached" if is_cached else "Freshly Generated",
+        "TokenExpiry": cache_expiry,
+        "TimeStats": {
+            "TotalTime": f"{total_time:.2f}s",
+            "TokenRetrievalTime": f"{token_time:.2f}s",
+            "LikeSendingTime": f"{send_time:.2f}s"
+        },
+        "Note": f"Used {len(fresh_tokens)} accounts. Successfully sent {likes_sent} likes. {failed_count} failed. Tokens {'cached' if is_cached else 'freshly generated'}.",
+        "Owner": "@OPTITAN"
+    }
+    
+    return jsonify(response_data)
+
+@app.route('/refresh_tokens', methods=['GET'])
+def refresh_tokens():
+    """Manually refresh all tokens"""
+    api_key = request.headers.get("X-API-KEY") or request.args.get("api_key")
+    if api_key != API_KEY:
+        return jsonify({"error": "Unauthorized. Invalid API key."}), 401
+    
+    print("🔄 Manual token refresh requested")
+    tokens = generate_all_tokens()
+    
+    return jsonify({
+        "status": "success",
+        "message": f"Generated {len(tokens)} fresh tokens",
+        "total_tokens": len(tokens),
+        "total_accounts": len(ACCOUNTS)
+    })
+
+@app.route('/cache_status', methods=['GET'])
+def cache_status():
+    """Check current token cache status"""
+    api_key = request.headers.get("X-API-KEY") or request.args.get("api_key")
+    if api_key != API_KEY:
+        return jsonify({"error": "Unauthorized. Invalid API key."}), 401
+    
+    cache_data = load_token_cache()
+    is_valid = is_token_cache_valid(cache_data)
+    
+    return jsonify({
+        "cache_exists": bool(cache_data and cache_data.get("tokens")),
+        "is_valid": is_valid,
+        "total_tokens": len(cache_data.get("tokens", [])) if cache_data else 0,
+        "generated_at": cache_data.get("generated_at", "N/A") if cache_data else "N/A",
+        "expires_at": cache_data.get("expires_at", "N/A") if cache_data else "N/A",
+        "expiry_hours": TOKEN_EXPIRY_HOURS,
+        "total_accounts": len(ACCOUNTS)
     })
 
 @app.route('/accounts', methods=['GET'])
@@ -384,12 +620,34 @@ def view_accounts():
 
 @app.route('/', methods=['GET'])
 def home():
+    cache_data = load_token_cache()
+    is_valid = is_token_cache_valid(cache_data)
+    
     return jsonify({
         "status": "online",
-        "message": "Free Fire Like Bot API",
-        "endpoint": "/like?uid=UID&server_name=REGION&api_key=TITAN",
+        "message": "Free Fire Like Bot API with Token Caching",
+        "endpoints": {
+            "/like": "Send likes with limit parameter",
+            "/refresh_tokens": "Manually refresh all tokens",
+            "/cache_status": "Check token cache status",
+            "/accounts": "View all accounts"
+        },
+        "limit_usage": {
+            "description": "Control how many likes to send",
+            "limit=10": "Try to send exactly 10 likes using 10 accounts",
+            "limit=0": "Use all available accounts (send maximum likes)",
+            "no_limit": "Same as limit=0 (use all accounts)",
+            "example": "/like?uid=123&server_name=IND&api_key=TITAN&limit=5"
+        },
+        "token_cache": {
+            "status": "Valid" if is_valid else "Invalid/Expired",
+            "cached_tokens": len(cache_data.get("tokens", [])) if cache_data else 0,
+            "expiry_hours": TOKEN_EXPIRY_HOURS,
+            "expires_at": cache_data.get("expires_at", "N/A") if cache_data else "N/A"
+        },
         "accounts_file": "accounts.json",
-        "total_accounts": len(ACCOUNTS)
+        "total_accounts": len(ACCOUNTS),
+        "performance": "Fast response due to token caching (tokens reused for 5 hours)"
     })
 
 # Vercel handler
@@ -400,4 +658,11 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 1000))
     print(f"🚀 Like API Running on port {port}")
     print(f"📁 Loaded {len(ACCOUNTS)} accounts from accounts.json")
+    print(f"⏰ Tokens valid for {TOKEN_EXPIRY_HOURS} hours")
+    print(f"📌 Using token caching for faster responses")
+    
+    # Pre-generate tokens on startup
+    print("🔄 Pre-generating tokens...")
+    generate_all_tokens()
+    
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
