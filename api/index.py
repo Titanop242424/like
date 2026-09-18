@@ -14,20 +14,25 @@ import random
 import time
 import os
 import hashlib
+import threading
 from datetime import datetime, timedelta
 
 app = Flask(__name__)
 
 API_KEY = "TITAN"
 TOKEN_CACHE_FILE = "tokens_cache.json"
-TOKEN_EXPIRY_HOURS = 8
+TOKEN_EXPIRY_HOURS = 8          # ✅ Changed from 5 to 8
+TOKEN_SAFETY_BUFFER_SEC = 60    # ✅ 1-min safety margin before expiry
 
 # ================= JWT API CONFIGURATION =================
 # Replace this with the API address you can access normally
 JWT_API_URL = "https://ff-jwt-gen-api.lovable.app/api/public/token"
 # ==========================================
 
-# ================= TOKEN CACHE MANAGEMENT (Simplified) =================
+# ✅ Global lock so concurrent /like requests don't double-generate tokens
+_token_lock = threading.Lock()
+
+# ================= TOKEN CACHE MANAGEMENT =================
 def load_token_cache():
     try:
         if os.path.exists(TOKEN_CACHE_FILE):
@@ -35,10 +40,10 @@ def load_token_cache():
                 cache_data = json.load(f)
                 print(f"✅ Loaded token cache")
                 return cache_data
-        return {"tokens": [], "generated_at": None}
+        return {"tokens": [], "generated_at": None, "expires_at": None}
     except Exception as e:
         print(f"⚠️ Error loading token cache: {e}")
-        return {"tokens": [], "generated_at": None}
+        return {"tokens": [], "generated_at": None, "expires_at": None}
 
 def save_token_cache(cache_data):
     try:
@@ -51,6 +56,12 @@ def save_token_cache(cache_data):
         return False
 
 def is_token_cache_valid(cache_data):
+    """
+    Cache is valid only if:
+      - tokens list is non-empty
+      - generated_at exists and is parseable
+      - age < TOKEN_EXPIRY_HOURS minus safety buffer
+    """
     if not cache_data or not cache_data.get("tokens"):
         return False
     generated_at = cache_data.get("generated_at")
@@ -58,15 +69,18 @@ def is_token_cache_valid(cache_data):
         return False
     try:
         gen_time = datetime.fromisoformat(generated_at)
-        time_diff = datetime.now() - gen_time
-        if time_diff.total_seconds() < (TOKEN_EXPIRY_HOURS * 3600):
-            return True
-        return False
-    except:
+        age_seconds = (datetime.now() - gen_time).total_seconds()
+        max_age_seconds = (TOKEN_EXPIRY_HOURS * 3600) - TOKEN_SAFETY_BUFFER_SEC
+        return age_seconds < max_age_seconds
+    except Exception:
         return False
 
 def get_cached_tokens():
-    """Return the FULL cached token list if valid, else None."""
+    """
+    ✅ Returns the FULL cached token list if the cache is still valid.
+    Returns None if the cache is missing or expired.
+    (No `limit` slicing here — slicing happens in get_tokens.)
+    """
     cache_data = load_token_cache()
     if not is_token_cache_valid(cache_data):
         return None
@@ -81,6 +95,17 @@ def update_token_cache(new_tokens):
     }
     save_token_cache(cache_data)
     return cache_data
+
+def seconds_until_expiry(cache_data):
+    """Helper for logging remaining validity time."""
+    try:
+        expires_at = cache_data.get("expires_at")
+        if not expires_at:
+            return 0
+        delta = datetime.fromisoformat(expires_at) - datetime.now()
+        return max(0, int(delta.total_seconds()))
+    except Exception:
+        return 0
 
 # ================= LOAD ACCOUNTS =================
 def load_accounts():
@@ -128,66 +153,58 @@ def enc_profile_check_payload(uid: int) -> str:
     protobuf_data = create_protobuf_for_profile_check(uid)
     return encrypt_message(protobuf_data)
 
-# ================= JWT ACQUISITION (EXTERNAL API VERSION) =================
+# ================= JWT ACQUISITION (EXTERNAL API) =================
 def get_jwt_from_external_api(uid, password):
     """
-    Obtain JWT through external API
-    Returns JWT string on success, None on failure
+    Obtain JWT through external API.
+    Returns JWT string on success, None on failure.
     """
     try:
-        # Construct request URL
-        params = {
-            "uid": uid,
-            "password": password
-        }
-        
+        params = {"uid": uid, "password": password}
+
         print(f"   🌐 Requesting JWT for {uid} from external API...")
-        
-        # Send GET request
+
         response = requests.get(
-            JWT_API_URL, 
-            params=params, 
+            JWT_API_URL,
+            params=params,
             timeout=20,
             verify=False
         )
-        
+
         print(f"   📡 API Response Status: {response.status_code}")
-        
+
         if response.status_code != 200:
             print(f"   ⚠️ API error {response.status_code}: {response.text[:200]}")
             return None
-        
+
         # Parse response
         try:
             data = response.json()
-        except:
-            # If response is not JSON, try to extract JWT from text
+        except Exception:
             text = response.text.strip()
             if text.startswith("eyJ"):
                 print(f"   ✅ JWT extracted from text response")
                 return text
             print(f"   ⚠️ Cannot parse response: {text[:200]}")
             return None
-        
-        # Try different possible response fields
+
         token = data.get("token") or data.get("jwt") or data.get("access_token")
-        
+
         if not token:
-            # Sometimes the response might directly be a string
             if isinstance(data, str) and data.startswith("eyJ"):
                 token = data
             else:
-                print(f"   ⚠️ No token field in response: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                print(f"   ⚠️ No token field in response: "
+                      f"{list(data.keys()) if isinstance(data, dict) else type(data)}")
                 return None
-        
-        # Validate JWT format
+
         if token and token.startswith("eyJ") and len(token) > 100:
             print(f"   ✅ JWT obtained (length: {len(token)})")
             return token
         else:
             print(f"   ⚠️ Invalid JWT format (length: {len(token) if token else 0})")
             return None
-            
+
     except requests.exceptions.Timeout:
         print(f"   ❌ Timeout requesting JWT for {uid}")
         return None
@@ -199,57 +216,68 @@ def get_jwt_from_external_api(uid, password):
         return None
 
 def get_token_for_account(acc):
-    """
-    Obtain JWT for a single account
-    """
     uid = acc.get("uid")
     password = acc.get("password")
-    
+
     if not uid or not password:
         print(f"   ⚠️ Missing uid or password for account")
         return None
-    
+
     token = get_jwt_from_external_api(uid, password)
-    
     if token:
         return {"token": token, "uid": uid}
     return None
 
 def generate_all_tokens():
-    """Obtain JWT for all accounts"""
-    if not ACCOUNTS:
-        print("❌ No accounts available")
-        return []
-    
-    print(f"🔄 Generating tokens for {len(ACCOUNTS)} accounts via external API...")
-    tokens = []
-    
-    for acc in ACCOUNTS:
-        token_data = get_token_for_account(acc)
-        if token_data:
-            tokens.append(token_data)
-        # Small delay to avoid rate limiting
-        time.sleep(0.5)
-    
-    print(f"✅ Generated {len(tokens)} valid tokens out of {len(ACCOUNTS)} accounts")
-    
-    if tokens:
-        update_token_cache(tokens)
-    
-    return tokens
+    """
+    ✅ Thread-safe token generation with double-checked locking.
+    - Acquires a lock so only one thread generates at a time.
+    - Inside the lock, re-checks the cache; if another thread already
+      populated it while we were waiting, reuse it.
+    """
+    with _token_lock:
+        # Double-check: maybe another thread already generated tokens
+        cached = get_cached_tokens()
+        if cached:
+            print(f"✅ Another thread already refreshed cache — "
+                  f"reusing {len(cached)} tokens")
+            return cached
+
+        if not ACCOUNTS:
+            print("❌ No accounts available")
+            return []
+
+        print(f"🔄 Generating tokens for {len(ACCOUNTS)} accounts via external API...")
+        tokens = []
+
+        for acc in ACCOUNTS:
+            token_data = get_token_for_account(acc)
+            if token_data:
+                tokens.append(token_data)
+            time.sleep(0.5)  # avoid rate limit
+
+        print(f"✅ Generated {len(tokens)} valid tokens out of {len(ACCOUNTS)} accounts")
+
+        if tokens:
+            update_token_cache(tokens)
+
+        return tokens
 
 def get_tokens(limit=None):
     """
-    1. If cache is valid (not older than TOKEN_EXPIRY_HOURS) → use it.
-    2. If no cache or expired → generate fresh and cache.
-    3. If `limit` requested and cache has fewer tokens than limit → still use cache
-       (don't regenerate, just use what you have).
+    ✅ FIXED LOGIC:
+      1. If cache is valid → use it. Slice to `limit` if requested.
+         (Never regenerate just because limit > cache size.)
+      2. If cache is empty/expired → generate fresh & cache for 8h.
     """
     cached = get_cached_tokens()
 
     if cached:
+        cache_data = load_token_cache()
+        remain = seconds_until_expiry(cache_data)
         print(f"✅ Using {len(cached)} cached tokens "
-              f"(expires at {load_token_cache().get('expires_at')})")
+              f"({remain}s until expiry)")
+
         if limit and limit > 0:
             return cached[:limit]
         return cached
@@ -257,13 +285,13 @@ def get_tokens(limit=None):
     print("🔄 Cache empty or expired → generating fresh tokens...")
     return generate_all_tokens()
 
-# ================= LIKE SENDING FUNCTIONS =================
+# ================= LIKE SENDING =================
 async def send_single_like_request(encrypted_like_payload, token_dict, url):
     edata = bytes.fromhex(encrypted_like_payload)
     token_value = token_dict.get("token", "")
     if not token_value:
         return 999
-    
+
     headers = {
         'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
         'Connection': "Keep-Alive",
@@ -276,8 +304,12 @@ async def send_single_like_request(encrypted_like_payload, token_dict, url):
     }
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.post(url, data=edata, headers=headers, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                print(f"   Like response for {token_dict.get('uid', 'unknown')}: {response.status}")
+            async with session.post(
+                url, data=edata, headers=headers,
+                timeout=aiohttp.ClientTimeout(total=15)
+            ) as response:
+                print(f"   Like response for {token_dict.get('uid', 'unknown')}: "
+                      f"{response.status}")
                 return response.status
     except Exception as e:
         print(f"   Like error: {e}")
@@ -286,9 +318,12 @@ async def send_single_like_request(encrypted_like_payload, token_dict, url):
 async def send_likes_with_token_batch(uid, server_region, like_api_url, token_batch):
     like_protobuf_payload = create_protobuf_message(uid, server_region)
     encrypted_like_payload = encrypt_message(like_protobuf_payload)
-    tasks = [send_single_like_request(encrypted_like_payload, t, like_api_url) for t in token_batch]
+    tasks = [
+        send_single_like_request(encrypted_like_payload, t, like_api_url)
+        for t in token_batch
+    ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    
+
     successful = 0
     failed = 0
     for r in results:
@@ -302,7 +337,7 @@ async def send_likes_with_token_batch(uid, server_region, like_api_url, token_ba
             failed += 1
         else:
             failed += 1
-    
+
     return successful, failed
 
 # ================= PROFILE CHECK =================
@@ -310,14 +345,14 @@ def make_profile_check_request(encrypted_profile_payload, server_name, token_dic
     token_value = token_dict.get("token", "")
     if not token_value:
         return None
-    
+
     if server_name == "IND":
         url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
     elif server_name in {"BR", "US", "SAC", "NA"}:
         url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
     else:
         url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
-    
+
     edata = bytes.fromhex(encrypted_profile_payload)
     headers = {
         'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -328,7 +363,7 @@ def make_profile_check_request(encrypted_profile_payload, server_name, token_dic
         'X-GA': "v1 1",
         'Accept-Encoding': "gzip"
     }
-    
+
     try:
         resp = requests.post(url, data=edata, headers=headers, verify=False, timeout=15)
         if resp.status_code == 200:
@@ -344,7 +379,7 @@ def get_likes_from_info(info):
         if info and hasattr(info, 'AccountInfo'):
             if hasattr(info.AccountInfo, 'Likes'):
                 return int(info.AccountInfo.Likes)
-    except:
+    except Exception:
         pass
     return 0
 
@@ -353,7 +388,7 @@ def get_name_from_info(info):
         if info and hasattr(info, 'AccountInfo'):
             if hasattr(info.AccountInfo, 'PlayerNickname'):
                 return str(info.AccountInfo.PlayerNickname)
-    except:
+    except Exception:
         pass
     return "N/A"
 
@@ -366,7 +401,7 @@ def handle_requests():
 
     uid_param = request.args.get("uid")
     server_name_param = request.args.get("server_name", "").upper()
-    
+
     likes_limit_param = request.args.get("limit")
     if likes_limit_param is not None:
         try:
@@ -377,36 +412,43 @@ def handle_requests():
             return jsonify({"error": "Invalid limit value. Must be a number."}), 400
     else:
         likes_limit = 0
-    
+
     if not uid_param or not server_name_param:
         return jsonify({"error": "UID and server_name are required"}), 400
 
     print(f"📊 Processing like request for UID: {uid_param}, Region: {server_name_param}")
 
     start_time = time.time()
+
+    # ✅ Capture cache info BEFORE fetching, for accurate "TokenSource" reporting
+    pre_cache = load_token_cache()
+    was_cache_valid = is_token_cache_valid(pre_cache)
+
     token_limit = likes_limit if likes_limit > 0 else None
     fresh_tokens = get_tokens(token_limit)
-    
+
     if not fresh_tokens:
-        return jsonify({"error": "Failed to get any valid tokens. Check accounts.json and JWT API."}), 500
+        return jsonify({
+            "error": "Failed to get any valid tokens. Check accounts.json and JWT API."
+        }), 500
 
     token_time = time.time() - start_time
     print(f"⏱️ Token retrieval took {token_time:.2f} seconds")
 
     if likes_limit > 0 and len(fresh_tokens) > likes_limit:
         fresh_tokens = fresh_tokens[:likes_limit]
-    
+
     print(f"✅ Using {len(fresh_tokens)} tokens")
 
     visit_token = fresh_tokens[0]
     encrypted_profile = enc_profile_check_payload(int(uid_param))
-    
+
     before_info = make_profile_check_request(encrypted_profile, server_name_param, visit_token)
     before_likes = get_likes_from_info(before_info)
     player_name = get_name_from_info(before_info)
-    
+
     print(f"📊 Before likes: {before_likes}")
-    
+
     if server_name_param == "IND":
         like_api_url = "https://client.ind.freefiremobile.com/LikeProfile"
     elif server_name_param in {"BR", "US", "SAC", "NA"}:
@@ -418,26 +460,32 @@ def handle_requests():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
-        likes_sent, failed_count = loop.run_until_complete(send_likes_with_token_batch(uid_param, server_name_param, like_api_url, fresh_tokens))
+        likes_sent, failed_count = loop.run_until_complete(
+            send_likes_with_token_batch(
+                uid_param, server_name_param, like_api_url, fresh_tokens
+            )
+        )
     finally:
         loop.close()
     send_time = time.time() - send_start
-        
+
     print(f"❤️ Likes sent successfully: {likes_sent}, Failed: {failed_count}")
-    
+
     time.sleep(2)
     after_info = make_profile_check_request(encrypted_profile, server_name_param, visit_token)
     after_likes = get_likes_from_info(after_info)
-    
+
     print(f"📊 After likes: {after_likes}")
-    
+
     likes_given = after_likes - before_likes
     total_time = time.time() - start_time
-    
+
+    # ✅ Post-request cache status
     cache_data = load_token_cache()
     is_cached = is_token_cache_valid(cache_data)
     cache_expiry = cache_data.get("expires_at", "N/A") if cache_data else "N/A"
-    
+    remain_sec = seconds_until_expiry(cache_data)
+
     requested_display = likes_limit if likes_limit > 0 else "ALL"
     response_data = {
         "LikesGivenByAPI": likes_given,
@@ -451,17 +499,20 @@ def handle_requests():
         "FailedLikes": failed_count,
         "TotalAccountsUsed": len(fresh_tokens),
         "TotalAccountsAvailable": len(ACCOUNTS),
-        "TokenSource": "Cached" if is_cached else "Freshly Generated",
+        "TokenSource": "Cached" if was_cache_valid else "Freshly Generated",
+        "TokenCacheValidNow": is_cached,
         "TokenExpiry": cache_expiry,
+        "TokenSecondsRemaining": remain_sec,
         "TimeStats": {
             "TotalTime": f"{total_time:.2f}s",
             "TokenRetrievalTime": f"{token_time:.2f}s",
             "LikeSendingTime": f"{send_time:.2f}s"
         },
-        "Note": f"Used {len(fresh_tokens)} accounts. Tokens from external API.",
+        "Note": f"Used {len(fresh_tokens)} accounts. "
+                f"Tokens cached for {TOKEN_EXPIRY_HOURS}h.",
         "Owner": "@OPTITAN"
     }
-    
+
     return jsonify(response_data)
 
 @app.route('/refresh_tokens', methods=['GET'])
@@ -469,15 +520,25 @@ def refresh_tokens():
     api_key = request.headers.get("X-API-KEY") or request.args.get("api_key")
     if api_key != API_KEY:
         return jsonify({"error": "Unauthorized. Invalid API key."}), 401
-    
+
     print("🔄 Manual token refresh requested")
+
+    # ✅ Force regeneration by clearing the cache first
+    try:
+        if os.path.exists(TOKEN_CACHE_FILE):
+            os.remove(TOKEN_CACHE_FILE)
+            print("🗑️ Old cache removed")
+    except Exception as e:
+        print(f"⚠️ Could not remove old cache: {e}")
+
     tokens = generate_all_tokens()
-    
+
     return jsonify({
         "status": "success",
         "message": f"Generated {len(tokens)} fresh tokens via external API",
         "total_tokens": len(tokens),
-        "total_accounts": len(ACCOUNTS)
+        "total_accounts": len(ACCOUNTS),
+        "expires_in_hours": TOKEN_EXPIRY_HOURS
     })
 
 @app.route('/cache_status', methods=['GET'])
@@ -485,17 +546,19 @@ def cache_status():
     api_key = request.headers.get("X-API-KEY") or request.args.get("api_key")
     if api_key != API_KEY:
         return jsonify({"error": "Unauthorized. Invalid API key."}), 401
-    
+
     cache_data = load_token_cache()
     is_valid = is_token_cache_valid(cache_data)
-    
+
     return jsonify({
         "cache_exists": bool(cache_data and cache_data.get("tokens")),
         "is_valid": is_valid,
         "total_tokens": len(cache_data.get("tokens", [])) if cache_data else 0,
         "generated_at": cache_data.get("generated_at", "N/A") if cache_data else "N/A",
         "expires_at": cache_data.get("expires_at", "N/A") if cache_data else "N/A",
+        "seconds_remaining": seconds_until_expiry(cache_data) if cache_data else 0,
         "expiry_hours": TOKEN_EXPIRY_HOURS,
+        "safety_buffer_seconds": TOKEN_SAFETY_BUFFER_SEC,
         "total_accounts": len(ACCOUNTS)
     })
 
@@ -510,10 +573,11 @@ def view_accounts():
 def home():
     cache_data = load_token_cache()
     is_valid = is_token_cache_valid(cache_data)
-    
+    remain = seconds_until_expiry(cache_data) if cache_data else 0
+
     return jsonify({
         "status": "online",
-        "message": "Free Fire Like Bot API - External JWT API",
+        "message": "Free Fire Like Bot API - External JWT API (8h cache)",
         "jwt_api": JWT_API_URL,
         "endpoints": {
             "/like": "Send likes with limit parameter",
@@ -530,19 +594,29 @@ def home():
             "status": "Valid" if is_valid else "Invalid/Expired",
             "cached_tokens": len(cache_data.get("tokens", [])) if cache_data else 0,
             "expiry_hours": TOKEN_EXPIRY_HOURS,
-            "expires_at": cache_data.get("expires_at", "N/A") if cache_data else "N/A"
+            "expires_at": cache_data.get("expires_at", "N/A") if cache_data else "N/A",
+            "seconds_remaining": remain
         },
         "total_accounts": len(ACCOUNTS)
     })
 
+# ================= STARTUP =================
 if __name__ == '__main__':
     port = int(os.environ.get("PORT", 1000))
     print(f"🚀 Like API Running on port {port}")
     print(f"📁 Loaded {len(ACCOUNTS)} accounts")
-    print(f"⏰ Tokens valid for {TOKEN_EXPIRY_HOURS} hours")
+    print(f"⏰ Tokens valid for {TOKEN_EXPIRY_HOURS} hours "
+          f"(safety buffer: {TOKEN_SAFETY_BUFFER_SEC}s)")
     print(f"🔗 JWT API: {JWT_API_URL}")
-    
-    print("🔄 Pre-generating tokens...")
-    generate_all_tokens()
-    
+
+    # ✅ Reuse existing cache at startup if still valid
+    existing_cache = get_cached_tokens()
+    if existing_cache:
+        remain = seconds_until_expiry(load_token_cache())
+        print(f"✅ Reusing {len(existing_cache)} cached tokens "
+              f"({remain}s remaining). Skipping generation.")
+    else:
+        print("🔄 No valid cache found — pre-generating tokens...")
+        generate_all_tokens()
+
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
