@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 API_KEY = "TITAN"
 TOKEN_CACHE_FILE = "tokens_cache.json"
-TOKEN_EXPIRY_HOURS = 5
+TOKEN_EXPIRY_HOURS = 8
 
 # ================= JWT API CONFIGURATION =================
 # Replace this with the API address you can access normally
@@ -65,14 +65,12 @@ def is_token_cache_valid(cache_data):
     except:
         return False
 
-def get_cached_tokens(limit=None):
+def get_cached_tokens():
+    """Return the FULL cached token list if valid, else None."""
     cache_data = load_token_cache()
     if not is_token_cache_valid(cache_data):
         return None
-    tokens = cache_data.get("tokens", [])
-    if limit and limit > 0:
-        return tokens[:limit]
-    return tokens
+    return cache_data.get("tokens", [])
 
 def update_token_cache(new_tokens):
     cache_data = {
@@ -241,21 +239,22 @@ def generate_all_tokens():
     return tokens
 
 def get_tokens(limit=None):
-    """Get tokens from cache if valid, otherwise generate new ones"""
-    cached_tokens = get_cached_tokens(limit)
-    
-    if cached_tokens is not None:
+    """
+    1. If cache is valid (not older than TOKEN_EXPIRY_HOURS) → use it.
+    2. If no cache or expired → generate fresh and cache.
+    3. If `limit` requested and cache has fewer tokens than limit → still use cache
+       (don't regenerate, just use what you have).
+    """
+    cached = get_cached_tokens()
+
+    if cached:
+        print(f"✅ Using {len(cached)} cached tokens "
+              f"(expires at {load_token_cache().get('expires_at')})")
         if limit and limit > 0:
-            if len(cached_tokens) >= limit:
-                print(f"✅ Using {limit} cached tokens")
-                return cached_tokens[:limit]
-            else:
-                print(f"⚠️ Cache has {len(cached_tokens)} tokens, need {limit}. Regenerating...")
-        else:
-            print(f"✅ Using all {len(cached_tokens)} cached tokens")
-            return cached_tokens
-    
-    print("🔄 Generating fresh tokens...")
+            return cached[:limit]
+        return cached
+
+    print("🔄 Cache empty or expired → generating fresh tokens...")
     return generate_all_tokens()
 
 # ================= LIKE SENDING FUNCTIONS =================
