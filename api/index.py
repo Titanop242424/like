@@ -29,6 +29,12 @@ TOKEN_EXPIRY_HOURS = 8
 TOKEN_SAFETY_BUFFER_SEC = 60
 CACHE_KEY = "ff_like:tokens_cache"
 
+# ✅ NEW: Cooldown & rotation config
+COOLDOWN_HOURS = 24
+COOLDOWN_KEY_PREFIX = "ff_like:cooldown:"
+ROTATION_KEY = "ff_like:account_rotation_index"
+MAX_LIKES_PER_REQUEST = 100  # hard cap per request
+
 # ✅ Upstash credentials (env vars preferred, fallbacks included)
 UPSTASH_URL = os.environ.get(
     "UPSTASH_REDIS_REST_URL",
@@ -43,7 +49,6 @@ UPSTASH_TOKEN = os.environ.get(
 redis_client = None
 try:
     redis_client = Redis(url=UPSTASH_URL, token=UPSTASH_TOKEN)
-    # quick sanity check
     redis_client.set("__healthcheck__", "ok", ex=10)
     assert redis_client.get("__healthcheck__") == "ok"
     print("✅ Connected to Upstash Redis")
@@ -51,41 +56,119 @@ except Exception as e:
     print(f"❌ Upstash Redis connection failed: {e}")
     redis_client = None
 
-# Thread lock so concurrent requests don't double-generate
 _token_lock = threading.Lock()
 
-# ================= TOKEN CACHE (Redis-backed) =================
+
+# ================= NEW: COOLDOWN HELPERS =================
+def get_cooldown_key(uid: str) -> str:
+    return f"{COOLDOWN_KEY_PREFIX}{uid}"
+
+
+def check_cooldown(uid: str):
+    """
+    Returns (is_on_cooldown, seconds_remaining, last_like_time_iso).
+    If no cooldown active, returns (False, 0, None).
+    """
+    if not redis_client:
+        return False, 0, None
+    try:
+        key = get_cooldown_key(uid)
+        raw = redis_client.get(key)
+        if not raw:
+            return False, 0, None
+
+        data = json.loads(raw)
+        last_time = datetime.fromisoformat(data["last_like_time"])
+        elapsed = (datetime.now() - last_time).total_seconds()
+        cooldown_sec = COOLDOWN_HOURS * 3600
+
+        if elapsed < cooldown_sec:
+            remain = int(cooldown_sec - elapsed)
+            return True, remain, data["last_like_time"]
+        return False, 0, None
+    except Exception as e:
+        print(f"⚠️ Cooldown check error: {e}")
+        return False, 0, None
+
+
+def set_cooldown(uid: str):
+    """Mark UID as 'liked now' with 24h TTL."""
+    if not redis_client:
+        return
+    try:
+        key = get_cooldown_key(uid)
+        payload = {
+            "last_like_time": datetime.now().isoformat(),
+            "uid": uid
+        }
+        redis_client.set(key, json.dumps(payload), ex=COOLDOWN_HOURS * 3600)
+        print(f"⏱️ Cooldown set for UID {uid} (TTL={COOLDOWN_HOURS}h)")
+    except Exception as e:
+        print(f"⚠️ Cooldown set error: {e}")
+
+
+def format_remaining(seconds: int) -> str:
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h}h {m}m {s}s"
+
+
+# ================= NEW: ACCOUNT ROTATION =================
+def get_rotated_tokens(all_tokens, count):
+    """
+    Return `count` tokens starting from a rotating offset, so we don't
+    always pick the first N accounts. Wraps around the list.
+    """
+    if not all_tokens:
+        return []
+    if count >= len(all_tokens):
+        return list(all_tokens)
+
+    # Get current offset from Redis (or 0)
+    offset = 0
+    if redis_client:
+        try:
+            raw = redis_client.get(ROTATION_KEY)
+            if raw:
+                offset = int(raw)
+        except Exception:
+            offset = 0
+
+    offset = offset % len(all_tokens)
+    rotated = all_tokens[offset:] + all_tokens[:offset]
+
+    # Advance offset for next call
+    new_offset = (offset + count) % len(all_tokens)
+    if redis_client:
+        try:
+            redis_client.set(ROTATION_KEY, str(new_offset))
+        except Exception:
+            pass
+
+    return rotated[:count]
+
+
+# ================= TOKEN CACHE =================
 def load_token_cache():
-    """Load cache dict from Redis. Never returns None."""
     if not redis_client:
         return {"tokens": [], "generated_at": None, "expires_at": None}
     try:
         raw = redis_client.get(CACHE_KEY)
         if not raw:
-            print("🔍 [cache] No cache in Redis yet")
             return {"tokens": [], "generated_at": None, "expires_at": None}
-        cache_data = json.loads(raw)
-        print(f"🔍 [cache] Loaded {len(cache_data.get('tokens', []))} tokens from Redis")
-        return cache_data
+        return json.loads(raw)
     except Exception as e:
         print(f"❌ [cache] Load error: {e}")
         return {"tokens": [], "generated_at": None, "expires_at": None}
 
 
 def save_token_cache(cache_data):
-    """Save cache to Redis with TTL = TOKEN_EXPIRY_HOURS."""
     if not redis_client:
-        print("⚠️ [cache] Redis not configured — cannot save")
         return False
     try:
         ttl_seconds = int(TOKEN_EXPIRY_HOURS * 3600)
-        redis_client.set(
-            CACHE_KEY,
-            json.dumps(cache_data),
-            ex=ttl_seconds
-        )
-        print(f"💾 [cache] Saved {len(cache_data.get('tokens', []))} tokens to Redis "
-              f"(TTL={TOKEN_EXPIRY_HOURS}h)")
+        redis_client.set(CACHE_KEY, json.dumps(cache_data), ex=ttl_seconds)
         return True
     except Exception as e:
         print(f"❌ [cache] Save error: {e}")
@@ -93,31 +176,21 @@ def save_token_cache(cache_data):
 
 
 def is_token_cache_valid(cache_data):
-    """Return True only if cache exists and is fresh enough."""
     if not cache_data or not cache_data.get("tokens"):
         return False
-
     generated_at = cache_data.get("generated_at")
     if not generated_at:
         return False
-
     try:
         gen_time = datetime.fromisoformat(generated_at)
         age_sec = (datetime.now() - gen_time).total_seconds()
         max_age_sec = (TOKEN_EXPIRY_HOURS * 3600) - TOKEN_SAFETY_BUFFER_SEC
-
-        if age_sec < max_age_sec:
-            print(f"✅ [cache] Valid (age={age_sec:.0f}s, max={max_age_sec}s)")
-            return True
-        print(f"⚠️ [cache] Expired (age={age_sec:.0f}s, max={max_age_sec}s)")
-        return False
-    except Exception as e:
-        print(f"❌ [cache] Parse error: {e}")
+        return age_sec < max_age_sec
+    except Exception:
         return False
 
 
 def get_cached_tokens():
-    """Return full token list if cache valid, else None."""
     cache_data = load_token_cache()
     if not is_token_cache_valid(cache_data):
         return None
@@ -164,7 +237,6 @@ def load_accounts():
 
 
 ACCOUNTS = load_accounts()
-
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
@@ -198,56 +270,28 @@ def enc_profile_check_payload(uid: int) -> str:
     return encrypt_message(protobuf_data)
 
 
-# ================= JWT ACQUISITION (EXTERNAL API) =================
+# ================= JWT ACQUISITION =================
 def get_jwt_from_external_api(uid, password):
-    """Obtain JWT through external API. Returns JWT string or None."""
     try:
         params = {"uid": uid, "password": password}
-        print(f"   🌐 Requesting JWT for {uid} from external API...")
-
-        response = requests.get(
-            JWT_API_URL,
-            params=params,
-            timeout=20,
-            verify=False
-        )
-        print(f"   📡 API Response Status: {response.status_code}")
-
+        response = requests.get(JWT_API_URL, params=params, timeout=20, verify=False)
         if response.status_code != 200:
-            print(f"   ⚠️ API error {response.status_code}: {response.text[:200]}")
             return None
-
         try:
             data = response.json()
         except Exception:
             text = response.text.strip()
             if text.startswith("eyJ"):
-                print("   ✅ JWT extracted from text response")
                 return text
-            print(f"   ⚠️ Cannot parse response: {text[:200]}")
             return None
-
         token = data.get("token") or data.get("jwt") or data.get("access_token")
-
         if not token:
             if isinstance(data, str) and data.startswith("eyJ"):
                 token = data
             else:
-                print(f"   ⚠️ No token field in response: "
-                      f"{list(data.keys()) if isinstance(data, dict) else type(data)}")
                 return None
-
         if token and token.startswith("eyJ") and len(token) > 100:
-            print(f"   ✅ JWT obtained (length: {len(token)})")
             return token
-        print(f"   ⚠️ Invalid JWT format (length: {len(token) if token else 0})")
-        return None
-
-    except requests.exceptions.Timeout:
-        print(f"   ❌ Timeout requesting JWT for {uid}")
-        return None
-    except requests.exceptions.ConnectionError:
-        print(f"   ❌ Connection error requesting JWT for {uid}")
         return None
     except Exception as e:
         print(f"   ❌ Error requesting JWT for {uid}: {e}")
@@ -258,7 +302,6 @@ def get_token_for_account(acc):
     uid = acc.get("uid")
     password = acc.get("password")
     if not uid or not password:
-        print("   ⚠️ Missing uid or password for account")
         return None
     token = get_jwt_from_external_api(uid, password)
     if token:
@@ -267,49 +310,28 @@ def get_token_for_account(acc):
 
 
 def generate_all_tokens():
-    """Thread-safe generation with double-checked cache lock."""
     with _token_lock:
         cached = get_cached_tokens()
         if cached:
-            print(f"♻️ [gen] Skipping — cache already valid ({len(cached)} tokens)")
             return cached
-
         if not ACCOUNTS:
-            print("❌ [gen] No accounts available")
             return []
-
-        print(f"🔄 [gen] Generating tokens for {len(ACCOUNTS)} accounts...")
         tokens = []
         for acc in ACCOUNTS:
             token_data = get_token_for_account(acc)
             if token_data:
                 tokens.append(token_data)
-            time.sleep(0.5)  # rate-limit friendly
-
-        print(f"✅ [gen] Generated {len(tokens)}/{len(ACCOUNTS)} valid tokens")
-
+            time.sleep(0.5)
         if tokens:
             update_token_cache(tokens)
         return tokens
 
 
-def get_tokens(limit=None):
-    """
-    1. If Redis cache valid → return it (sliced to `limit`).
-    2. Else → generate fresh & cache for 8h.
-    Never regenerates just because limit > cache size.
-    """
+def get_tokens():
+    """Return full token list (no slicing here — rotation handles selection)."""
     cached = get_cached_tokens()
-
     if cached:
-        cache_data = load_token_cache()
-        remain = seconds_until_expiry(cache_data)
-        print(f"✅ [tokens] USING CACHE ({len(cached)} tokens, {remain}s remaining)")
-        if limit and limit > 0:
-            return cached[:limit]
         return cached
-
-    print("🔄 [tokens] Cache empty or expired → generating fresh")
     return generate_all_tokens()
 
 
@@ -319,7 +341,6 @@ async def send_single_like_request(encrypted_like_payload, token_dict, url):
     token_value = token_dict.get("token", "")
     if not token_value:
         return 999
-
     headers = {
         'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
         'Connection': "Keep-Alive",
@@ -336,38 +357,21 @@ async def send_single_like_request(encrypted_like_payload, token_dict, url):
                 url, data=edata, headers=headers,
                 timeout=aiohttp.ClientTimeout(total=15)
             ) as response:
-                print(f"   Like response for {token_dict.get('uid', 'unknown')}: "
-                      f"{response.status}")
                 return response.status
-    except Exception as e:
-        print(f"   Like error: {e}")
+    except Exception:
         return 997
 
 
 async def send_likes_with_token_batch(uid, server_region, like_api_url, token_batch):
     like_protobuf_payload = create_protobuf_message(uid, server_region)
     encrypted_like_payload = encrypt_message(like_protobuf_payload)
-
     tasks = [
         send_single_like_request(encrypted_like_payload, t, like_api_url)
         for t in token_batch
     ]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    successful = 0
-    failed = 0
-    for r in results:
-        if isinstance(r, int) and r == 200:
-            successful += 1
-        elif isinstance(r, int) and r == 403:
-            print("⚠️ 403 Forbidden - Token may be invalid")
-            failed += 1
-        elif isinstance(r, int) and r == 429:
-            print("⚠️ 429 Rate limited")
-            failed += 1
-        else:
-            failed += 1
-
+    successful = sum(1 for r in results if isinstance(r, int) and r == 200)
+    failed = len(results) - successful
     return successful, failed
 
 
@@ -376,14 +380,12 @@ def make_profile_check_request(encrypted_profile_payload, server_name, token_dic
     token_value = token_dict.get("token", "")
     if not token_value:
         return None
-
     if server_name == "IND":
         url = "https://client.ind.freefiremobile.com/GetPlayerPersonalShow"
     elif server_name in {"BR", "US", "SAC", "NA"}:
         url = "https://client.us.freefiremobile.com/GetPlayerPersonalShow"
     else:
         url = "https://clientbp.ggpolarbear.com/GetPlayerPersonalShow"
-
     edata = bytes.fromhex(encrypted_profile_payload)
     headers = {
         'User-Agent': "Dalvik/2.1.0 (Linux; U; Android 9; ASUS_Z01QD Build/PI)",
@@ -394,7 +396,6 @@ def make_profile_check_request(encrypted_profile_payload, server_name, token_dic
         'X-GA': "v1 1",
         'Accept-Encoding': "gzip"
     }
-
     try:
         resp = requests.post(url, data=edata, headers=headers, verify=False, timeout=15)
         if resp.status_code == 200:
@@ -450,29 +451,47 @@ def handle_requests():
     if not uid_param or not server_name_param:
         return jsonify({"error": "UID and server_name are required"}), 400
 
-    print(f"📊 Processing like request for UID: {uid_param}, Region: {server_name_param}")
+    # ========== NEW: 24h COOLDOWN CHECK ==========
+    on_cd, remain_sec, last_time = check_cooldown(uid_param)
+    if on_cd:
+        return jsonify({
+            "status": 429,
+            "error": "Cooldown active",
+            "message": f"UID {uid_param} already received likes recently. "
+                       f"Please wait before requesting again.",
+            "UID": uid_param,
+            "LastLikedAt": last_time,
+            "CooldownHours": COOLDOWN_HOURS,
+            "SecondsRemaining": remain_sec,
+            "RemainingTime": format_remaining(remain_sec),
+            "Owner": "@OPTITAN"
+        }), 429
 
+    print(f"📊 Processing like request for UID: {uid_param}, Region: {server_name_param}")
     start_time = time.time()
 
-    # Snapshot cache validity BEFORE fetching
-    pre_cache = load_token_cache()
-    was_cache_valid = is_token_cache_valid(pre_cache)
-
-    token_limit = likes_limit if likes_limit > 0 else None
-    fresh_tokens = get_tokens(token_limit)
-
-    if not fresh_tokens:
+    # ========== NEW: Fetch ALL tokens, then rotate-select ==========
+    all_tokens = get_tokens()
+    if not all_tokens:
         return jsonify({
             "error": "Failed to get any valid tokens. Check accounts.json and JWT API."
         }), 500
 
+    total_available = len(all_tokens)
+
+    # Determine how many to use
+    if likes_limit > 0:
+        requested = min(likes_limit, total_available, MAX_LIKES_PER_REQUEST)
+    else:
+        # Use all accounts but cap to MAX_LIKES_PER_REQUEST
+        requested = min(total_available, MAX_LIKES_PER_REQUEST)
+
+    # Rotate selection so we don't always hit first N
+    fresh_tokens = get_rotated_tokens(all_tokens, requested)
+
     token_time = time.time() - start_time
-    print(f"⏱️ Token retrieval took {token_time:.2f} seconds")
 
-    if likes_limit > 0 and len(fresh_tokens) > likes_limit:
-        fresh_tokens = fresh_tokens[:likes_limit]
-
-    print(f"✅ Using {len(fresh_tokens)} tokens")
+    print(f"✅ Using {len(fresh_tokens)}/{total_available} tokens (rotated)")
 
     visit_token = fresh_tokens[0]
     encrypted_profile = enc_profile_check_payload(int(uid_param))
@@ -512,10 +531,14 @@ def handle_requests():
     likes_given = after_likes - before_likes
     total_time = time.time() - start_time
 
+    # ========== NEW: Set cooldown AFTER successful like ==========
+    if likes_given > 0:
+        set_cooldown(uid_param)
+
     cache_data = load_token_cache()
     is_cached_now = is_token_cache_valid(cache_data)
     cache_expiry = cache_data.get("expires_at", "N/A")
-    remain_sec = seconds_until_expiry(cache_data)
+    remain_sec_cache = seconds_until_expiry(cache_data)
 
     response_data = {
         "LikesGivenByAPI": likes_given,
@@ -527,23 +550,46 @@ def handle_requests():
         "RequestedLikes": likes_limit if likes_limit > 0 else "ALL",
         "LikesSent": likes_sent,
         "FailedLikes": failed_count,
-        "TotalAccountsUsed": len(fresh_tokens),
-        "TotalAccountsAvailable": len(ACCOUNTS),
-        "TokenSource": "Cached" if was_cache_valid else "Freshly Generated",
+        "AccountsUsedThisRequest": len(fresh_tokens),
+        "TotalAccountsAvailable": total_available,
+        "RotationEnabled": True,
+        "CooldownSetForHours": COOLDOWN_HOURS if likes_given > 0 else 0,
+        "TokenSource": "Cached" if is_cached_now else "Freshly Generated",
         "TokenCacheValidNow": is_cached_now,
         "TokenExpiry": cache_expiry,
-        "TokenSecondsRemaining": remain_sec,
+        "TokenSecondsRemaining": remain_sec_cache,
         "TimeStats": {
             "TotalTime": f"{total_time:.2f}s",
             "TokenRetrievalTime": f"{token_time:.2f}s",
             "LikeSendingTime": f"{send_time:.2f}s"
         },
         "CacheBackend": "Upstash Redis",
-        "Note": f"Used {len(fresh_tokens)} accounts. Tokens cached for "
-                f"{TOKEN_EXPIRY_HOURS}h in Redis.",
         "Owner": "@OPTITAN"
     }
     return jsonify(response_data)
+
+
+@app.route('/cooldown_status', methods=['GET'])
+def cooldown_status():
+    """NEW: Check cooldown status for a UID."""
+    api_key = request.headers.get("X-API-KEY") or request.args.get("api_key")
+    if api_key != API_KEY:
+        return jsonify({"error": "Unauthorized. Invalid API key."}), 401
+
+    uid_param = request.args.get("uid")
+    if not uid_param:
+        return jsonify({"error": "uid is required"}), 400
+
+    on_cd, remain_sec, last_time = check_cooldown(uid_param)
+    return jsonify({
+        "UID": uid_param,
+        "OnCooldown": on_cd,
+        "LastLikedAt": last_time,
+        "CooldownHours": COOLDOWN_HOURS,
+        "SecondsRemaining": remain_sec,
+        "RemainingTime": format_remaining(remain_sec) if on_cd else "0h 0m 0s",
+        "Owner": "@OPTITAN"
+    })
 
 
 @app.route('/refresh_tokens', methods=['GET'])
@@ -552,18 +598,13 @@ def refresh_tokens():
     if api_key != API_KEY:
         return jsonify({"error": "Unauthorized. Invalid API key."}), 401
 
-    print("🔄 Manual token refresh requested")
-
-    # Force clear cache
     try:
         if redis_client:
             redis_client.delete(CACHE_KEY)
-            print("🗑️ Redis cache cleared")
     except Exception as e:
         print(f"⚠️ Could not clear Redis cache: {e}")
 
     tokens = generate_all_tokens()
-
     return jsonify({
         "status": "success",
         "message": f"Generated {len(tokens)} fresh tokens via external API",
@@ -583,6 +624,15 @@ def cache_status():
     cache_data = load_token_cache()
     is_valid = is_token_cache_valid(cache_data)
 
+    rotation_index = 0
+    if redis_client:
+        try:
+            raw = redis_client.get(ROTATION_KEY)
+            if raw:
+                rotation_index = int(raw)
+        except Exception:
+            pass
+
     return jsonify({
         "cache_backend": "Upstash Redis" if redis_client else "DISABLED (no Redis)",
         "cache_exists": bool(cache_data and cache_data.get("tokens")),
@@ -593,7 +643,10 @@ def cache_status():
         "seconds_remaining": seconds_until_expiry(cache_data),
         "expiry_hours": TOKEN_EXPIRY_HOURS,
         "safety_buffer_seconds": TOKEN_SAFETY_BUFFER_SEC,
-        "total_accounts": len(ACCOUNTS)
+        "total_accounts": len(ACCOUNTS),
+        "rotation_index": rotation_index,
+        "cooldown_hours": COOLDOWN_HOURS,
+        "max_likes_per_request": MAX_LIKES_PER_REQUEST
     })
 
 
@@ -613,20 +666,30 @@ def home():
 
     return jsonify({
         "status": "online",
-        "message": "Free Fire Like Bot API — Upstash Redis cache (8h)",
+        "message": "Free Fire Like Bot API — Upstash Redis cache (8h) + 24h UID cooldown + account rotation",
         "jwt_api": JWT_API_URL,
         "cache_backend": "Upstash Redis" if redis_client else "DISABLED",
         "endpoints": {
-            "/like": "Send likes with limit parameter",
+            "/like": "Send likes (24h cooldown per UID, rotated accounts)",
+            "/cooldown_status": "Check cooldown for a UID (?uid=xxx)",
             "/refresh_tokens": "Manually refresh all tokens",
             "/cache_status": "Check token cache status",
             "/accounts": "View all accounts"
         },
         "limit_usage": {
-            "limit=10": "Try to send exactly 10 likes using 10 accounts",
-            "limit=0": "Use all available accounts",
+            "limit=10": "Send ~10 likes using 10 rotated accounts",
+            "limit=0": "Use all available accounts (up to cap)",
             "example": "/like?uid=123&server_name=IND&api_key=TITAN&limit=5"
         },
+        "cooldown": {
+            "hours": COOLDOWN_HOURS,
+            "description": "Each UID can only receive likes once per 24h"
+        },
+        "rotation": {
+            "enabled": True,
+            "description": "Accounts are rotated so all get used fairly"
+        },
+        "max_likes_per_request": MAX_LIKES_PER_REQUEST,
         "token_cache": {
             "status": "Valid" if is_valid else "Invalid/Expired",
             "cached_tokens": len(cache_data.get("tokens", [])),
@@ -644,17 +707,14 @@ if __name__ == '__main__':
     print(f"🚀 Like API Running on port {port}")
     print(f"📁 Loaded {len(ACCOUNTS)} accounts")
     print(f"⏰ Tokens valid for {TOKEN_EXPIRY_HOURS} hours")
+    print(f"⏱️ Cooldown: {COOLDOWN_HOURS}h per UID")
     print(f"🔗 JWT API: {JWT_API_URL}")
-    print(f"🗄️ Cache backend: "
-          f"{'Upstash Redis' if redis_client else 'DISABLED (set UPSTASH_REDIS_REST_URL/TOKEN)'}")
 
     existing = get_cached_tokens()
     if existing:
-        remain = seconds_until_expiry(load_token_cache())
-        print(f"✅ Startup: reusing {len(existing)} cached tokens "
-              f"({remain}s remaining). Skipping generation.")
+        print(f"✅ Startup: reusing {len(existing)} cached tokens")
     else:
-        print("🔄 Startup: no valid cache — pre-generating tokens...")
+        print("🔄 Startup: generating tokens...")
         generate_all_tokens()
 
     app.run(host='0.0.0.0', port=port, debug=False, use_reloader=False)
